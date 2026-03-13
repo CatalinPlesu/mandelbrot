@@ -20,6 +20,14 @@ use std::{fs, io::Write};
 
 mod colorschemes;
 
+fn log_event(event: &str, details: &str) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0));
+    let ts_ms = now.as_secs() * 1000 + now.subsec_millis() as u64;
+    println!("{}ms [{}] {}", ts_ms, event, details);
+}
+
 #[derive(Clone, Debug)]
 struct Point<T> {
     x: T,
@@ -427,6 +435,20 @@ fn start_fractal_job(
     render_id: u64,
     sender: mpsc::Sender<RenderMessage>,
 ) {
+    log_event(
+        "render_start",
+        &format!(
+            "id={} size={}x{} bands={} threads={} max_iter={} power={} scale={}",
+            render_id,
+            screen_width,
+            screen_height,
+            singl.bands,
+            singl.threads,
+            singl.max_iter,
+            singl.power,
+            singl.scale
+        ),
+    );
     let singl_clone = singl.clone();
     thread::spawn(move || {
         let mut bands = band_order_center_out(singl_clone.bands);
@@ -479,6 +501,10 @@ fn start_fractal_job(
 
                 let finished = completed_clone.fetch_add(1, Ordering::SeqCst) + 1;
                 if finished == singl_local.bands {
+                    log_event(
+                        "render_done",
+                        &format!("id={} bands={}", render_id, singl_local.bands),
+                    );
                     let _ = sender_clone.send(RenderMessage::Done { id: render_id });
                 }
 
@@ -720,6 +746,10 @@ fn user_input(singl: &mut Singleton) {
             singl.refresh = true;
             singl.last_refresh =
                 Instant::now() - Duration::from_millis(singl.refresh_limit + 1);
+            log_event(
+                "julia_set",
+                &format!("world=({}, {})", singl.julia.x, singl.julia.y),
+            );
         }
         if is_mouse_button_pressed(MouseButton::Left) && !singl.mouse_click {
             let mouse = mouse_position();
@@ -730,6 +760,10 @@ fn user_input(singl: &mut Singleton) {
                     y: mouse.1,
                 },
                 Point::<f32> { x: 0., y: 0. },
+            );
+            log_event(
+                "drag_start",
+                &format!("screen=({}, {})", mouse.0, mouse.1),
             );
         }
 
@@ -748,6 +782,10 @@ fn user_input(singl: &mut Singleton) {
             singl.target_center = singl.center.clone();
             singl.refresh = true;
             singl.last_refresh = Instant::now();
+            log_event(
+                "drag_end",
+                &format!("center=({}, {})", singl.center.x, singl.center.y),
+            );
         }
 
         if mouse_wheel().1 != 0. {
@@ -772,20 +810,30 @@ fn user_input(singl: &mut Singleton) {
             singl.target_center.y += before.y - after.y;
             singl.zoom_pending = true;
             singl.last_zoom_input = Instant::now();
+            log_event(
+                "zoom",
+                &format!(
+                    "scale={} center=({}, {})",
+                    singl.target_scale, singl.target_center.x, singl.target_center.y
+                ),
+            );
         }
     }
 
     if is_key_pressed(KeyCode::Enter) {
         singl.refresh = true;
         singl.last_refresh = Instant::now() - Duration::from_millis(singl.refresh_limit + 1);
+        log_event("refresh", "key=enter");
     }
 
     if is_key_pressed(KeyCode::Escape) {
         singl.egui = !singl.egui;
+        log_event("toggle_ui", &format!("enabled={}", singl.egui));
     }
 
     if is_key_pressed(KeyCode::Space) {
         singl.animation = !singl.animation;
+        log_event("toggle_animation", &format!("enabled={}", singl.animation));
     }
 
     if is_key_pressed(KeyCode::Tab) {
@@ -795,6 +843,12 @@ fn user_input(singl: &mut Singleton) {
         }
         singl.generate_colors();
         singl.recolor = true;
+        let schemes = colorschemes::colorschemes();
+        let name = schemes
+            .get(singl.colorscheme)
+            .map(|scheme| scheme.name)
+            .unwrap_or("unknown");
+        log_event("colorscheme", &format!("index={} name={}", singl.colorscheme, name));
     }
 }
 
@@ -831,9 +885,30 @@ async fn main() {
     let mut compute_in_flight = false;
     let mut render_id: u64 = 0;
     let mut inflight_cache: Option<RenderCache> = None;
+    let mut last_screen_w = screen_w;
+    let mut last_screen_h = screen_h;
 
     loop {
         clear_background(LIGHTGRAY);
+
+        let current_w = screen_width() as usize;
+        let current_h = screen_height() as usize;
+        if current_w != 0
+            && current_h != 0
+            && (current_w != last_screen_w || current_h != last_screen_h)
+        {
+            last_screen_w = current_w;
+            last_screen_h = current_h;
+            caches.clear();
+            inflight_cache = None;
+            compute_in_flight = false;
+            singl.refresh = true;
+            singl.last_refresh = Instant::now() - Duration::from_millis(singl.refresh_limit + 1);
+            log_event(
+                "resize",
+                &format!("size={}x{}", last_screen_w, last_screen_h),
+            );
+        }
 
         while let Ok(message) = receiver.try_recv() {
             match message {
@@ -841,6 +916,10 @@ async fn main() {
                     if id != render_id {
                         continue;
                     }
+                    log_event(
+                        "band_complete",
+                        &format!("id={} band={} len={}", id, index, iters.len()),
+                    );
                     if let Some(cache) = inflight_cache.as_mut() {
                         if index < cache.iter_bands.len() {
                             cache.iter_bands[index] = iters;
@@ -867,6 +946,10 @@ async fn main() {
                     if id != render_id {
                         continue;
                     }
+                    log_event(
+                        "render_complete",
+                        &format!("id={} caches_before={}", id, caches.len()),
+                    );
                     if let Some(cache) = inflight_cache.take() {
                         caches.retain(|existing| {
                             (existing.scale - cache.scale).abs() > f64::EPSILON
@@ -883,6 +966,10 @@ async fn main() {
                             caches.truncate(6);
                         }
                     }
+                    log_event(
+                        "render_complete",
+                        &format!("id={} caches_after={}", id, caches.len()),
+                    );
                     compute_in_flight = false;
                 }
             }
@@ -929,6 +1016,18 @@ async fn main() {
                 singl.generate_colors();
                 let screen_w = screen_width() as usize;
                 let screen_h = screen_height() as usize;
+                log_event(
+                    "refresh_start",
+                    &format!(
+                        "id={} size={}x{} scale={} center=({}, {})",
+                        render_id.wrapping_add(1),
+                        screen_w,
+                        screen_h,
+                        singl.scale,
+                        singl.center.x,
+                        singl.center.y
+                    ),
+                );
                 render_id = render_id.wrapping_add(1);
                 inflight_cache = Some(RenderCache {
                     center: singl.center.clone(),
