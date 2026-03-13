@@ -31,6 +31,19 @@ impl Point<f64> {
                 + singl.center.y,
         }
     }
+
+    fn to_world_with_dims(
+        &self,
+        singl: &Singleton,
+        screen_width: f64,
+        screen_height: f64,
+    ) -> Point<f64> {
+        let unit = map_screen_to_world_with_dims(singl, screen_width, screen_height);
+        Point::<f64> {
+            x: (self.x - singl.offset.1.x as f64 - screen_width / 2f64) * unit + singl.center.x,
+            y: -(self.y - singl.offset.1.y as f64 - screen_height / 2f64) * unit + singl.center.y,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -113,27 +126,33 @@ fn mandelbrot(c: num::complex::Complex<f64>, singl: &Singleton) -> usize {
     return i;
 }
 fn map_screen_to_world(singl: &Singleton) -> f64 {
+    map_screen_to_world_with_dims(singl, screen_width() as f64, screen_height() as f64)
+}
+
+fn map_screen_to_world_with_dims(singl: &Singleton, screen_width: f64, screen_height: f64) -> f64 {
     let world_unit: f64;
-    if screen_width() < screen_height() {
-        world_unit = 4f64 / (screen_width() as f64 * singl.scale);
+    if screen_width < screen_height {
+        world_unit = 4f64 / (screen_width * singl.scale);
     } else {
-        world_unit = 4f64 / (screen_height() as f64 * singl.scale);
+        world_unit = 4f64 / (screen_height * singl.scale);
     }
-    return world_unit;
+    world_unit
 }
 
 fn fractal(singl: &Singleton) -> Vec<Texture2D> {
+    let screen_width = screen_width() as usize;
+    let screen_height = screen_height() as usize;
     let mut bands = Vec::new();
     for i in 0..singl.bands {
         bands.push(i);
     }
 
     let mut images = Vec::new();
-    let mut band_height = screen_height() as usize / singl.bands;
+    let mut band_height = screen_height / singl.bands;
     band_height += band_height * singl.bands / 10;
     for _ in 0..singl.bands {
         images.push(Image::gen_image_color(
-            screen_width() as u16,
+            screen_width as u16,
             band_height as u16,
             WHITE,
         ));
@@ -165,13 +184,13 @@ fn fractal(singl: &Singleton) -> Vec<Texture2D> {
 
                 let mut fractal = Image::gen_image_color(width as u16, height as u16, WHITE);
 
-                for x in 0..screen_width() as u32 {
+                for x in 0..screen_width as u32 {
                     for y in 0..height as u32 {
                         let point = Point::<f64> {
                             x: x as f64,
                             y: (index * height) as f64 + y as f64,
                         }
-                        .to_world(&local_singl);
+                        .to_world_with_dims(&local_singl, screen_width as f64, screen_height as f64);
                         let c = num::complex::Complex::<f64>::new(point.x, point.y);
 
                         let iter = mandelbrot(c, &local_singl);
@@ -364,7 +383,7 @@ async fn main() {
         }
 
         for i in 0..singl.bands {
-            draw_texture(textures[i], 0., i as f32 * textures[i].height(), WHITE);
+            draw_texture(&textures[i], 0., i as f32 * textures[i].height(), WHITE);
         }
 
         user_input(&mut singl);
