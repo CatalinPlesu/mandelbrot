@@ -67,19 +67,25 @@ struct Singleton {
     animation_unit: f64,
     threads: usize,
     bands: usize,
+    recolor: bool,
 }
 
 #[derive(Clone, Debug)]
 struct RenderCache {
     center: Point<f64>,
     scale: f64,
+    power: f64,
+    max_iter: usize,
+    bands: usize,
+    julia: Point<f64>,
     screen_width: f32,
     screen_height: f32,
     textures: Vec<Texture2D>,
+    iter_bands: Vec<Vec<u16>>,
 }
 
 enum RenderMessage {
-    Band { id: u64, index: usize, image: Image },
+    Band { id: u64, index: usize, iters: Vec<u16> },
     Done { id: u64 },
 }
 
@@ -103,6 +109,7 @@ impl Default for Singleton {
             animation_unit: 0.01,
             threads: 8,
             bands: 32,
+            recolor: false,
         }
     }
 }
@@ -169,6 +176,12 @@ fn band_height_for(singl: &Singleton, screen_height: usize) -> usize {
     band_height
 }
 
+fn band_height_for_dims(bands: usize, screen_height: usize) -> usize {
+    let mut band_height = screen_height / bands;
+    band_height += band_height * bands / 10;
+    band_height
+}
+
 fn empty_band_images(singl: &Singleton, screen_width: usize, screen_height: usize) -> Vec<Image> {
     let mut bands = Vec::new();
     for i in 0..singl.bands {
@@ -187,31 +200,44 @@ fn empty_band_images(singl: &Singleton, screen_width: usize, screen_height: usiz
     images
 }
 
-fn fractal_images(singl: &Singleton, screen_width: usize, screen_height: usize) -> Vec<Image> {
+fn empty_iter_bands(singl: &Singleton, screen_width: usize, screen_height: usize) -> Vec<Vec<u16>> {
+    let band_height = band_height_for(singl, screen_height);
+    let mut bands = Vec::new();
+    for _ in 0..singl.bands {
+        bands.push(vec![0u16; screen_width * band_height]);
+    }
+    bands
+}
+
+fn image_from_iters(iters: &[u16], width: usize, height: usize, pallet: &[Color]) -> Image {
+    let mut image = Image::gen_image_color(width as u16, height as u16, WHITE);
+    let max_index = pallet.len().saturating_sub(1);
+    for x in 0..width as u32 {
+        for y in 0..height as u32 {
+            let index = (y as usize) * width + x as usize;
+            let iter = iters[index] as usize;
+            let color = pallet[iter.min(max_index)];
+            image.set_pixel(x, y, color);
+        }
+    }
+    image
+}
+
+fn fractal_iter_bands(singl: &Singleton, screen_width: usize, screen_height: usize) -> Vec<Vec<u16>> {
     let mut bands = Vec::new();
     for i in 0..singl.bands {
         bands.push(i);
     }
 
-    let mut images = Vec::new();
-    let band_height = band_height_for(singl, screen_height);
-    for _ in 0..singl.bands {
-        images.push(Image::gen_image_color(
-            screen_width as u16,
-            band_height as u16,
-            WHITE,
-        ));
-    }
-
     let bands_mutex = Arc::new(Mutex::new(bands));
-    let images_mutex = Arc::new(Mutex::new(images));
+    let iter_mutex = Arc::new(Mutex::new(empty_iter_bands(singl, screen_width, screen_height)));
     let singl_mutex = Arc::new(singl.clone());
 
     let mut handles = Vec::new();
     for _ in 0..singl.threads {
         let singl_clone = Arc::clone(&singl_mutex);
         let bands_clone = Arc::clone(&bands_mutex);
-        let images_clone = Arc::clone(&images_mutex);
+        let iter_clone = Arc::clone(&iter_mutex);
         let handle = thread::spawn(move || {
             let local_singl = singl_clone;
             loop {
@@ -222,31 +248,27 @@ fn fractal_images(singl: &Singleton, screen_width: usize, screen_height: usize) 
                 let index = bands.remove(0);
                 drop(bands);
 
-                let images = images_clone.lock().unwrap();
-                let width = images[index].width();
-                let height = images[index].height();
-                drop(images);
-
-                let mut fractal = Image::gen_image_color(width as u16, height as u16, WHITE);
+                let band_height = band_height_for(&local_singl, screen_height);
+                let mut iters = vec![0u16; screen_width * band_height];
 
                 for x in 0..screen_width as u32 {
-                    for y in 0..height as u32 {
+                    for y in 0..band_height as u32 {
                         let point = Point::<f64> {
                             x: x as f64,
-                            y: (index * height) as f64 + y as f64,
+                            y: (index * band_height) as f64 + y as f64,
                         }
                         .to_world_with_dims(&local_singl, screen_width as f64, screen_height as f64);
                         let c = num::complex::Complex::<f64>::new(point.x, point.y);
 
                         let iter = mandelbrot(c, &local_singl);
-
-                        fractal.set_pixel(x, y, local_singl.pallet[iter]);
+                        let offset = (y as usize) * screen_width + x as usize;
+                        iters[offset] = iter.min(u16::MAX as usize) as u16;
                     }
                 }
 
-                let mut images = images_clone.lock().unwrap();
-                images[index] = fractal;
-                drop(images);
+                let mut iter_bands = iter_clone.lock().unwrap();
+                iter_bands[index] = iters;
+                drop(iter_bands);
                 thread::sleep(Duration::from_millis(1));
             }
         });
@@ -257,13 +279,13 @@ fn fractal_images(singl: &Singleton, screen_width: usize, screen_height: usize) 
         h.join().unwrap();
     }
 
-    let images_clone = Arc::clone(&images_mutex);
-    let images = images_clone.lock().unwrap();
+    let iter_clone = Arc::clone(&iter_mutex);
+    let iter_bands = iter_clone.lock().unwrap();
     let mut result = Vec::new();
     for i in 0..singl.bands {
-        result.push(images[i].clone());
+        result.push(iter_bands[i].clone());
     }
-    drop(images);
+    drop(iter_bands);
     result
 }
 
@@ -275,6 +297,41 @@ fn textures_from_images(images: Vec<Image>) -> Vec<Texture2D> {
         textures.push(texture);
     }
     textures
+}
+
+fn images_from_iter_bands(
+    iter_bands: &[Vec<u16>],
+    width: usize,
+    height: usize,
+    pallet: &[Color],
+) -> Vec<Image> {
+    let band_height = band_height_for_dims(iter_bands.len(), height);
+    let mut images = Vec::new();
+    for band in iter_bands {
+        images.push(image_from_iters(band, width, band_height, pallet));
+    }
+    images
+}
+
+fn update_cache_textures_from_iters(cache: &mut RenderCache, pallet: &[Color]) {
+    if cache.iter_bands.is_empty() {
+        return;
+    }
+    let width = cache.screen_width as usize;
+    let height = cache.screen_height as usize;
+    let band_height = band_height_for_dims(cache.iter_bands.len(), height);
+    for (index, band) in cache.iter_bands.iter().enumerate() {
+        if index >= cache.textures.len() {
+            continue;
+        }
+        if band.len() != width * band_height {
+            continue;
+        }
+        let image = image_from_iters(band, width, band_height, pallet);
+        let texture = Texture2D::from_image(&image);
+        texture.set_filter(FilterMode::Linear);
+        cache.textures[index] = texture;
+    }
 }
 
 fn draw_cached_textures(cache: &RenderCache, singl: &Singleton) {
@@ -350,8 +407,7 @@ fn start_fractal_job(
                 drop(bands);
 
                 let band_height = band_height_for(&singl_local, screen_height);
-                let mut fractal =
-                    Image::gen_image_color(screen_width as u16, band_height as u16, WHITE);
+                let mut iters = vec![0u16; screen_width * band_height];
 
                 for x in 0..screen_width as u32 {
                     for y in 0..band_height as u32 {
@@ -367,15 +423,15 @@ fn start_fractal_job(
                         let c = num::complex::Complex::<f64>::new(point.x, point.y);
 
                         let iter = mandelbrot(c, &singl_local);
-
-                        fractal.set_pixel(x, y, singl_local.pallet[iter]);
+                        let offset = (y as usize) * screen_width + x as usize;
+                        iters[offset] = iter.min(u16::MAX as usize) as u16;
                     }
                 }
 
                 let _ = sender_clone.send(RenderMessage::Band {
                     id: render_id,
                     index,
-                    image: fractal,
+                    iters,
                 });
 
                 let finished = completed_clone.fetch_add(1, Ordering::SeqCst) + 1;
@@ -405,6 +461,14 @@ fn select_cache_index(caches: &[RenderCache], singl: &Singleton) -> Option<usize
     let unit_new = map_screen_to_world_with_dims_scale(singl.scale, screen_w, screen_h);
 
     for (index, cache) in caches.iter().enumerate() {
+        if cache.max_iter != singl.max_iter
+            || cache.bands != singl.bands
+            || (cache.power - singl.power).abs() > f64::EPSILON
+            || (cache.julia.x - singl.julia.x).abs() > f64::EPSILON
+            || (cache.julia.y - singl.julia.y).abs() > f64::EPSILON
+        {
+            continue;
+        }
         let unit_old = map_screen_to_world_with_dims_scale(
             cache.scale,
             cache.screen_width as f64,
@@ -473,9 +537,7 @@ fn draw_menus(singl: &mut Singleton) {
                 if selected != singl.colorscheme {
                     singl.colorscheme = selected;
                     singl.generate_colors();
-                    singl.refresh = true;
-                    singl.last_refresh =
-                        Instant::now() - Duration::from_millis(singl.refresh_limit + 1);
+                    singl.recolor = true;
                 }
 
                 if ui.button("Refresh").clicked() {
@@ -627,8 +689,7 @@ fn user_input(singl: &mut Singleton) {
             singl.colorscheme = 0usize;
         }
         singl.generate_colors();
-        singl.refresh = true;
-        singl.last_refresh = Instant::now() - Duration::from_millis(singl.refresh_limit + 1);
+        singl.recolor = true;
     }
 }
 
@@ -643,14 +704,20 @@ async fn main() {
 
     let screen_w = screen_width() as usize;
     let screen_h = screen_height() as usize;
-    let images = fractal_images(&singl, screen_w, screen_h);
+    let iter_bands = fractal_iter_bands(&singl, screen_w, screen_h);
+    let images = images_from_iter_bands(&iter_bands, screen_w, screen_h, &singl.pallet);
     let textures = textures_from_images(images);
     let mut caches = vec![RenderCache {
         center: singl.center.clone(),
         scale: singl.scale,
+        power: singl.power,
+        max_iter: singl.max_iter,
+        bands: singl.bands,
+        julia: singl.julia.clone(),
         screen_width: screen_w as f32,
         screen_height: screen_h as f32,
         textures,
+        iter_bands,
     }];
 
     let (sender, receiver) = mpsc::channel::<RenderMessage>();
@@ -663,15 +730,29 @@ async fn main() {
 
         while let Ok(message) = receiver.try_recv() {
             match message {
-                RenderMessage::Band { id, index, image } => {
+                RenderMessage::Band { id, index, iters } => {
                     if id != render_id {
                         continue;
                     }
                     if let Some(cache) = inflight_cache.as_mut() {
+                        if index < cache.iter_bands.len() {
+                            cache.iter_bands[index] = iters;
+                        }
                         if index < cache.textures.len() {
-                            let texture = Texture2D::from_image(&image);
-                            texture.set_filter(FilterMode::Linear);
-                            cache.textures[index] = texture;
+                            let width = cache.screen_width as usize;
+                            let height = cache.screen_height as usize;
+                            let band_height = band_height_for_dims(cache.iter_bands.len(), height);
+                            if cache.iter_bands[index].len() == width * band_height {
+                                let image = image_from_iters(
+                                    &cache.iter_bands[index],
+                                    width,
+                                    band_height,
+                                    &singl.pallet,
+                                );
+                                let texture = Texture2D::from_image(&image);
+                                texture.set_filter(FilterMode::Linear);
+                                cache.textures[index] = texture;
+                            }
                         }
                     }
                 }
@@ -684,6 +765,11 @@ async fn main() {
                             (existing.scale - cache.scale).abs() > f64::EPSILON
                                 || (existing.center.x - cache.center.x).abs() > f64::EPSILON
                                 || (existing.center.y - cache.center.y).abs() > f64::EPSILON
+                                || (existing.power - cache.power).abs() > f64::EPSILON
+                                || existing.max_iter != cache.max_iter
+                                || existing.bands != cache.bands
+                                || (existing.julia.x - cache.julia.x).abs() > f64::EPSILON
+                                || (existing.julia.y - cache.julia.y).abs() > f64::EPSILON
                         });
                         caches.insert(0, cache);
                         if caches.len() > 6 {
@@ -695,6 +781,30 @@ async fn main() {
             }
         }
 
+        if singl.recolor {
+            for cache in caches.iter_mut() {
+                if cache.max_iter == singl.max_iter
+                    && cache.bands == singl.bands
+                    && (cache.power - singl.power).abs() <= f64::EPSILON
+                    && (cache.julia.x - singl.julia.x).abs() <= f64::EPSILON
+                    && (cache.julia.y - singl.julia.y).abs() <= f64::EPSILON
+                {
+                    update_cache_textures_from_iters(cache, &singl.pallet);
+                }
+            }
+            if let Some(cache) = inflight_cache.as_mut() {
+                if cache.max_iter == singl.max_iter
+                    && cache.bands == singl.bands
+                    && (cache.power - singl.power).abs() <= f64::EPSILON
+                    && (cache.julia.x - singl.julia.x).abs() <= f64::EPSILON
+                    && (cache.julia.y - singl.julia.y).abs() <= f64::EPSILON
+                {
+                    update_cache_textures_from_iters(cache, &singl.pallet);
+                }
+            }
+            singl.recolor = false;
+        }
+
         if singl.refresh && singl.last_refresh.elapsed().as_millis() > singl.refresh_limit as u128 {
             if !compute_in_flight {
                 singl.generate_colors();
@@ -704,9 +814,14 @@ async fn main() {
                 inflight_cache = Some(RenderCache {
                     center: singl.center.clone(),
                     scale: singl.scale,
+                    power: singl.power,
+                    max_iter: singl.max_iter,
+                    bands: singl.bands,
+                    julia: singl.julia.clone(),
                     screen_width: screen_w as f32,
                     screen_height: screen_h as f32,
                     textures: textures_from_images(empty_band_images(&singl, screen_w, screen_h)),
+                    iter_bands: empty_iter_bands(&singl, screen_w, screen_h),
                 });
                 start_fractal_job(&singl, screen_w, screen_h, render_id, sender.clone());
                 singl.refresh = false;
