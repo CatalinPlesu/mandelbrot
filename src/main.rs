@@ -4,6 +4,7 @@ use macroquad::input::*;
 use macroquad::prelude::vec2;
 use macroquad::shapes::*;
 use macroquad::texture::*;
+use macroquad::time::get_frame_time;
 use macroquad::window;
 use macroquad::window::*;
 
@@ -14,6 +15,8 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::{fs, io::Write};
 
 mod colorschemes;
 
@@ -52,15 +55,21 @@ impl Point<f64> {
 struct Singleton {
     power: f64,
     scale: f64,
+    target_scale: f64,
     max_iter: usize,
     colorscheme: usize,
     pallet: Vec<Color>,
     center: Point<f64>,
+    target_center: Point<f64>,
     julia: Point<f64>,
     offset: (Point<f32>, Point<f32>),
     refresh: bool,
     last_refresh: Instant,
     refresh_limit: u64,
+    last_zoom_input: Instant,
+    zoom_cooldown_ms: u64,
+    zoom_pending: bool,
+    zoom_lerp: f64,
     mouse_click: bool,
     egui: bool,
     animation: bool,
@@ -94,15 +103,21 @@ impl Default for Singleton {
         Singleton {
             power: 2.,
             scale: 1.,
+            target_scale: 1.,
             max_iter: 55,
             colorscheme: 0,
             pallet: Vec::new(),
             center: Point { x: 0., y: 0. },
+            target_center: Point { x: 0., y: 0. },
             julia: Point { x: 0., y: 0. },
             offset: (Point { x: 0., y: 0. }, Point { x: 0., y: 0. }),
             refresh: false,
             last_refresh: Instant::now(),
             refresh_limit: 100,
+            last_zoom_input: Instant::now() - Duration::from_secs(10),
+            zoom_cooldown_ms: 2000,
+            zoom_pending: false,
+            zoom_lerp: 12.0,
             mouse_click: false,
             egui: true,
             animation: false,
@@ -168,6 +183,37 @@ fn map_screen_to_world_with_dims_scale(scale: f64, screen_width: f64, screen_hei
         world_unit = 4f64 / (screen_height * scale);
     }
     world_unit
+}
+
+fn screen_point_to_world(point: Point<f64>, center: &Point<f64>, scale: f64, offset: &Point<f32>) -> Point<f64> {
+    let unit = map_screen_to_world_with_dims_scale(scale, screen_width() as f64, screen_height() as f64);
+    Point::<f64> {
+        x: (point.x - offset.x as f64 - screen_width() as f64 / 2f64) * unit + center.x,
+        y: -(point.y - offset.y as f64 - screen_height() as f64 / 2f64) * unit + center.y,
+    }
+}
+
+fn apply_zoom_lerp(singl: &mut Singleton) {
+    let dt = get_frame_time() as f64;
+    let t = (dt * singl.zoom_lerp).min(1.0);
+    if t <= 0.0 {
+        return;
+    }
+    let scale_delta = singl.target_scale - singl.scale;
+    if scale_delta.abs() < 1e-12 {
+        singl.scale = singl.target_scale;
+    } else {
+        singl.scale += scale_delta * t;
+    }
+
+    let center_dx = singl.target_center.x - singl.center.x;
+    let center_dy = singl.target_center.y - singl.center.y;
+    if center_dx.abs() < 1e-12 && center_dy.abs() < 1e-12 {
+        singl.center = singl.target_center.clone();
+    } else {
+        singl.center.x += center_dx * t;
+        singl.center.y += center_dy * t;
+    }
 }
 
 fn band_height_for(singl: &Singleton, screen_height: usize) -> usize {
@@ -383,10 +429,7 @@ fn start_fractal_job(
 ) {
     let singl_clone = singl.clone();
     thread::spawn(move || {
-        let mut bands = Vec::new();
-        for i in 0..singl_clone.bands {
-            bands.push(i);
-        }
+        let mut bands = band_order_center_out(singl_clone.bands);
         let bands_mutex = Arc::new(Mutex::new(bands));
         let singl_mutex = Arc::new(singl_clone);
         let completed = Arc::new(AtomicUsize::new(0));
@@ -448,6 +491,29 @@ fn start_fractal_job(
             let _ = h.join();
         }
     });
+}
+
+fn band_order_center_out(bands: usize) -> Vec<usize> {
+    if bands == 0 {
+        return Vec::new();
+    }
+    let mut ordered = Vec::with_capacity(bands);
+    let center = (bands - 1) as isize / 2;
+    ordered.push(center as usize);
+    for step in 1..bands {
+        let above = center - step as isize;
+        let below = center + step as isize;
+        if above >= 0 {
+            ordered.push(above as usize);
+        }
+        if below < bands as isize {
+            ordered.push(below as usize);
+        }
+        if ordered.len() >= bands {
+            break;
+        }
+    }
+    ordered
 }
 
 fn select_cache_index(caches: &[RenderCache], singl: &Singleton) -> Option<usize> {
@@ -516,6 +582,8 @@ fn draw_menus(singl: &mut Singleton) {
                     .changed();
 
                 if needs_refresh {
+                    singl.target_scale = singl.scale;
+                    singl.target_center = singl.center.clone();
                     singl.refresh = true;
                     singl.last_refresh = Instant::now();
                 }
@@ -601,6 +669,40 @@ fn draw_menus(singl: &mut Singleton) {
     }
 }
 
+fn save_snapshot(singl: &Singleton) {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::from_secs(0))
+        .as_secs();
+    let folder = "captures";
+    if fs::create_dir_all(folder).is_err() {
+        return;
+    }
+
+    let image_path = format!("{}/fractal_{}.png", folder, timestamp);
+    let meta_path = format!("{}/fractal_{}.txt", folder, timestamp);
+
+    let image = get_screen_data();
+    let _ = image.export_png(&image_path);
+
+    if let Ok(mut file) = fs::File::create(&meta_path) {
+        let schemes = colorschemes::colorschemes();
+        let scheme_name = schemes
+            .get(singl.colorscheme)
+            .map(|scheme| scheme.name)
+            .unwrap_or("unknown");
+        let _ = writeln!(file, "center_x: {}", singl.center.x);
+        let _ = writeln!(file, "center_y: {}", singl.center.y);
+        let _ = writeln!(file, "scale: {}", singl.scale);
+        let _ = writeln!(file, "power: {}", singl.power);
+        let _ = writeln!(file, "max_iter: {}", singl.max_iter);
+        let _ = writeln!(file, "colorscheme_index: {}", singl.colorscheme);
+        let _ = writeln!(file, "colorscheme_name: {}", scheme_name);
+        let _ = writeln!(file, "julia_x: {}", singl.julia.x);
+        let _ = writeln!(file, "julia_y: {}", singl.julia.y);
+    }
+}
+
 fn user_input(singl: &mut Singleton) {
     let xrest = 300.;
     let yrest = 400.;
@@ -643,30 +745,33 @@ fn user_input(singl: &mut Singleton) {
             singl.center.y += singl.offset.1.y as f64 * unit;
             singl.offset = (Point { x: 0., y: 0. }, Point { x: 0., y: 0. });
             singl.mouse_click = false;
+            singl.target_center = singl.center.clone();
             singl.refresh = true;
             singl.last_refresh = Instant::now();
         }
 
         if mouse_wheel().1 != 0. {
             let mouse = mouse_position();
-            let before = Point::<f64> {
+            let point = Point::<f64> {
                 x: mouse.0 as f64,
                 y: mouse.1 as f64,
+            };
+            let before = screen_point_to_world(
+                point.clone(),
+                &singl.target_center,
+                singl.target_scale,
+                &singl.offset.1,
+            );
+            let mut new_scale = singl.target_scale + singl.target_scale * (mouse_wheel().1 / 10.) as f64;
+            if new_scale < 1f64 {
+                new_scale = 1f64;
             }
-            .to_world(&singl);
-            singl.scale += singl.scale * (mouse_wheel().1 / 10.) as f64;
-            if singl.scale < 1f64 {
-                singl.scale = 1f64;
-            }
-            let after = Point::<f64> {
-                x: mouse.0 as f64,
-                y: mouse.1 as f64,
-            }
-            .to_world(&singl);
-            singl.center.x += before.x - after.x;
-            singl.center.y += before.y - after.y;
-            singl.refresh = true;
-            singl.last_refresh = Instant::now();
+            let after = screen_point_to_world(point, &singl.target_center, new_scale, &singl.offset.1);
+            singl.target_scale = new_scale;
+            singl.target_center.x += before.x - after.x;
+            singl.target_center.y += before.y - after.y;
+            singl.zoom_pending = true;
+            singl.last_zoom_input = Instant::now();
         }
     }
 
@@ -701,6 +806,8 @@ async fn main() {
         ..Default::default()
     };
     singl.generate_colors();
+    singl.target_scale = singl.scale;
+    singl.target_center = singl.center.clone();
 
     let screen_w = screen_width() as usize;
     let screen_h = screen_height() as usize;
@@ -805,6 +912,18 @@ async fn main() {
             singl.recolor = false;
         }
 
+        if singl.zoom_pending
+            && singl.last_zoom_input.elapsed().as_millis() >= singl.zoom_cooldown_ms as u128
+        {
+            singl.scale = singl.target_scale;
+            singl.center = singl.target_center.clone();
+            singl.refresh = true;
+            singl.last_refresh = Instant::now() - Duration::from_millis(singl.refresh_limit + 1);
+            singl.zoom_pending = false;
+        }
+
+        apply_zoom_lerp(&mut singl);
+
         if singl.refresh && singl.last_refresh.elapsed().as_millis() > singl.refresh_limit as u128 {
             if !compute_in_flight {
                 singl.generate_colors();
@@ -842,6 +961,10 @@ async fn main() {
 
         user_input(&mut singl);
         draw_menus(&mut singl);
+
+        if is_key_pressed(KeyCode::S) {
+            save_snapshot(&singl);
+        }
 
         window::next_frame().await
     }
