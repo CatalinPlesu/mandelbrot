@@ -126,6 +126,7 @@ struct RenderCache {
     render_scale: f32,
     texture: Texture2D,
     iters: Vec<u16>,
+    complete: bool,
 }
 
 struct InflightRender {
@@ -221,7 +222,7 @@ impl Singleton {
                         + (colorscheme.colors[i + 1].b - colorscheme.colors[i].b)
                             * (j as f32 / color as f32),
                     colorscheme.colors[i].a
-                        + (colorscheme.colors[i + 1].b - colorscheme.colors[i].b)
+                        + (colorscheme.colors[i + 1].a - colorscheme.colors[i].a)
                             * (j as f32 / color as f32),
                 ));
             }
@@ -391,10 +392,10 @@ fn tile_layout(width: usize, height: usize, tile_size: usize) -> (usize, usize) 
 
 fn tiles_checkerboard(width: usize, height: usize, tile_size: usize) -> (Vec<Tile>, usize, usize) {
     let (cols, rows) = tile_layout(width, height, tile_size);
-    let mut even = Vec::new();
-    let mut odd = Vec::new();
+    let mut rings: Vec<(Vec<(f32, Tile)>, Vec<(f32, Tile)>)> = Vec::new();
     let center_x = (cols as f32) * 0.5;
     let center_y = (rows as f32) * 0.5;
+    let mut max_ring = 0usize;
 
     for row in 0..rows {
         for col in 0..cols {
@@ -405,7 +406,14 @@ fn tiles_checkerboard(width: usize, height: usize, tile_size: usize) -> (Vec<Til
             let index = row * cols + col;
             let dx = col as f32 + 0.5 - center_x;
             let dy = row as f32 + 0.5 - center_y;
-            let dist = dx * dx + dy * dy;
+            let dist = (dx * dx + dy * dy).sqrt();
+            let ring = dist.floor() as usize;
+            if ring > max_ring {
+                max_ring = ring;
+            }
+            if rings.len() <= ring {
+                rings.resize_with(ring + 1, || (Vec::new(), Vec::new()));
+            }
             let tile = Tile {
                 index,
                 x,
@@ -414,19 +422,30 @@ fn tiles_checkerboard(width: usize, height: usize, tile_size: usize) -> (Vec<Til
                 height: height_tile,
             };
             if (row + col) % 2 == 0 {
-                even.push((dist, tile));
+                rings[ring].0.push((dist, tile));
             } else {
-                odd.push((dist, tile));
+                rings[ring].1.push((dist, tile));
             }
         }
     }
 
-    even.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-    odd.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
     let mut tiles = Vec::with_capacity(cols * rows);
-    tiles.extend(even.into_iter().map(|entry| entry.1));
-    tiles.extend(odd.into_iter().map(|entry| entry.1));
+    let seed_radius_tiles = 3usize.min(max_ring);
+    for ring in 0..=max_ring {
+        let (even, odd) = &mut rings[ring];
+        even.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        odd.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        if ring <= seed_radius_tiles {
+            let mut merged = Vec::with_capacity(even.len() + odd.len());
+            merged.extend(even.iter().cloned());
+            merged.extend(odd.iter().cloned());
+            merged.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            tiles.extend(merged.into_iter().map(|entry| entry.1));
+        } else {
+            tiles.extend(even.iter().cloned().map(|entry| entry.1));
+            tiles.extend(odd.iter().cloned().map(|entry| entry.1));
+        }
+    }
     (tiles, cols, rows)
 }
 
@@ -727,6 +746,7 @@ fn start_render(
         render_scale,
         texture,
         iters,
+        complete: false,
     };
 
     start_fractal_job(
@@ -783,7 +803,8 @@ fn select_cache_index(caches: &[RenderCache], singl: &Singleton) -> Option<usize
         let res_penalty = (1.0 / cache.render_scale.max(0.01) as f64).ln().max(0.0) * 0.5;
         let dx = (cache.center.x - singl.center.x).abs() / unit_new;
         let dy = (cache.center.y - singl.center.y).abs() / unit_new;
-        let score = scale_score * 2.0 + (dx + dy) / 1000.0 + res_penalty;
+        let incomplete_penalty = if cache.complete { 0.0 } else { 1.0 };
+        let score = scale_score * 2.0 + (dx + dy) / 1000.0 + res_penalty + incomplete_penalty;
         if score < best_score {
             best_score = score;
             best_index = Some(index);
@@ -1344,6 +1365,7 @@ async fn main() {
                         &format!("id={} caches_before={}", id, caches.len()),
                     );
                     if let Some(mut inflight) = inflight_render.take() {
+                        inflight.cache.complete = true;
                         inflight.cache.texture = texture_from_image(&inflight.image);
                         caches.retain(|existing| {
                             (existing.scale - inflight.cache.scale).abs() > f64::EPSILON
@@ -1371,7 +1393,8 @@ async fn main() {
 
         if singl.recolor {
             for cache in caches.iter_mut() {
-                if cache.max_iter == singl.max_iter
+                if cache.complete
+                    && cache.max_iter == singl.max_iter
                     && (cache.power - singl.power).abs() <= f64::EPSILON
                     && (cache.julia.x - singl.julia.x).abs() <= f64::EPSILON
                     && (cache.julia.y - singl.julia.y).abs() <= f64::EPSILON
@@ -1422,7 +1445,6 @@ async fn main() {
         if input_active && compute_in_flight {
             active_render_id.store(render_id.wrapping_add(1), Ordering::SeqCst);
             compute_in_flight = false;
-            inflight_render = None;
         }
 
         if input_active && singl.preview_while_interacting {
