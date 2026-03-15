@@ -798,10 +798,10 @@ fn draw_menus(singl: &mut Singleton) {
             egui::Window::new("Settings").show(egui_ctx, |ui| {
                 let mut needs_refresh = false;
                 needs_refresh |= ui
-                    .add(egui::Slider::new(&mut singl.scale, 1f64..=1_000_000f64).text("Zoom"))
+                    .add(egui::Slider::new(&mut singl.scale, 1f64..=1e12f64).text("Zoom"))
                     .changed();
                 needs_refresh |= ui
-                    .add(egui::Slider::new(&mut singl.max_iter, 0..=1_000).text("Max iterations"))
+                    .add(egui::Slider::new(&mut singl.max_iter, 0..=10_000).text("Max iterations"))
                     .changed();
                 needs_refresh |= ui
                     .add(egui::Slider::new(&mut singl.power, 0.0..=100.0).text("Power"))
