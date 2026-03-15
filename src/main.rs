@@ -11,8 +11,10 @@ use macroquad::window::*;
 use egui;
 use num;
 // use rand::Rng;
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
 use std::sync::{mpsc, Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -78,12 +80,18 @@ struct Singleton {
     zoom_cooldown_ms: u64,
     zoom_pending: bool,
     zoom_lerp: f64,
+    render_debounce_ms: u64,
+    preview_debounce_ms: u64,
+    input_idle_ms: u64,
+    last_input: Instant,
+    preview_scale: f32,
+    preview_while_interacting: bool,
+    tile_size: usize,
     mouse_click: bool,
     egui: bool,
     animation: bool,
     animation_unit: f64,
     threads: usize,
-    bands: usize,
     recolor: bool,
 }
 
@@ -93,16 +101,48 @@ struct RenderCache {
     scale: f64,
     power: f64,
     max_iter: usize,
-    bands: usize,
     julia: Point<f64>,
-    screen_width: f32,
-    screen_height: f32,
-    textures: Vec<Texture2D>,
-    iter_bands: Vec<Vec<u16>>,
+    render_width: f32,
+    render_height: f32,
+    viewport_width: f32,
+    viewport_height: f32,
+    render_scale: f32,
+    texture: Texture2D,
+    iters: Vec<u16>,
+}
+
+struct InflightRender {
+    cache: RenderCache,
+    image: Image,
+    tile_done: Vec<bool>,
+    tile_cols: usize,
+    tile_rows: usize,
+    tile_size: usize,
+    pending_tiles: usize,
+    last_texture_update: Instant,
+    texture_update_interval_ms: u64,
+    texture_update_stride: usize,
+}
+
+#[derive(Clone, Debug)]
+struct Tile {
+    index: usize,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
 }
 
 enum RenderMessage {
-    Band { id: u64, index: usize, iters: Vec<u16> },
+    Tile {
+        id: u64,
+        index: usize,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        iters: Vec<u16>,
+    },
     Done { id: u64 },
 }
 
@@ -126,12 +166,18 @@ impl Default for Singleton {
             zoom_cooldown_ms: 2000,
             zoom_pending: false,
             zoom_lerp: 12.0,
+            render_debounce_ms: 1200,
+            preview_debounce_ms: 120,
+            input_idle_ms: 150,
+            last_input: Instant::now() - Duration::from_secs(10),
+            preview_scale: 0.35,
+            preview_while_interacting: true,
+            tile_size: 64,
             mouse_click: false,
             egui: true,
             animation: false,
             animation_unit: 0.01,
             threads: 8,
-            bands: 32,
             recolor: false,
         }
     }
@@ -166,14 +212,101 @@ impl Singleton {
     }
 }
 
-fn mandelbrot(c: num::complex::Complex<f64>, singl: &Singleton) -> usize {
+fn mandelbrot_scalar(c_re: f64, c_im: f64, singl: &Singleton) -> u16 {
+    if (singl.power - 2.0).abs() <= f64::EPSILON {
+        let mut z_re = singl.julia.x;
+        let mut z_im = singl.julia.y;
+        let mut i = 0usize;
+        while i < singl.max_iter && (z_re * z_re + z_im * z_im) <= 4.0 {
+            let new_re = z_re * z_re - z_im * z_im + c_re;
+            let new_im = 2.0 * z_re * z_im + c_im;
+            z_re = new_re;
+            z_im = new_im;
+            i += 1;
+        }
+        return i.min(u16::MAX as usize) as u16;
+    }
+
     let mut z = num::complex::Complex::<f64>::new(singl.julia.x, singl.julia.y);
+    let c = num::complex::Complex::<f64>::new(c_re, c_im);
     let mut i: usize = 0;
     while i < singl.max_iter && z.l1_norm() <= 4f64 {
         z = z.powf(singl.power) + c;
         i += 1;
     }
-    return i;
+    i.min(u16::MAX as usize) as u16
+}
+
+fn should_use_simd(singl: &Singleton) -> bool {
+    if (singl.power - 2.0).abs() > f64::EPSILON {
+        return false;
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        return is_x86_feature_detected!("sse2");
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        return false;
+    }
+}
+
+fn mandelbrot_pair(c0_re: f64, c0_im: f64, c1_re: f64, c1_im: f64, singl: &Singleton) -> (u16, u16) {
+    #[cfg(target_arch = "x86_64")]
+    unsafe {
+        if !is_x86_feature_detected!("sse2") || (singl.power - 2.0).abs() > f64::EPSILON {
+            let a = mandelbrot_scalar(c0_re, c0_im, singl);
+            let b = mandelbrot_scalar(c1_re, c1_im, singl);
+            return (a, b);
+        }
+
+        let max_iter = singl.max_iter as i32;
+        let mut z_re = _mm_set1_pd(singl.julia.x);
+        let mut z_im = _mm_set1_pd(singl.julia.y);
+        let c_re = _mm_set_pd(c1_re, c0_re);
+        let c_im = _mm_set_pd(c1_im, c0_im);
+        let four = _mm_set1_pd(4.0);
+
+        let mut iter0 = 0i32;
+        let mut iter1 = 0i32;
+
+        for _ in 0..max_iter {
+            let z_re2 = _mm_mul_pd(z_re, z_re);
+            let z_im2 = _mm_mul_pd(z_im, z_im);
+            let mag2 = _mm_add_pd(z_re2, z_im2);
+            let mask = _mm_cmple_pd(mag2, four);
+            let mask_bits = _mm_movemask_pd(mask);
+            if mask_bits == 0 {
+                break;
+            }
+
+            let z_re_im = _mm_mul_pd(z_re, z_im);
+            let new_re = _mm_add_pd(_mm_sub_pd(z_re2, z_im2), c_re);
+            let new_im = _mm_add_pd(_mm_add_pd(z_re_im, z_re_im), c_im);
+
+            z_re = _mm_or_pd(_mm_and_pd(mask, new_re), _mm_andnot_pd(mask, z_re));
+            z_im = _mm_or_pd(_mm_and_pd(mask, new_im), _mm_andnot_pd(mask, z_im));
+
+            if (mask_bits & 0b01) != 0 {
+                iter0 += 1;
+            }
+            if (mask_bits & 0b10) != 0 {
+                iter1 += 1;
+            }
+        }
+
+        return (
+            (iter0 as usize).min(u16::MAX as usize) as u16,
+            (iter1 as usize).min(u16::MAX as usize) as u16,
+        );
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let a = mandelbrot_scalar(c0_re, c0_im, singl);
+        let b = mandelbrot_scalar(c1_re, c1_im, singl);
+        (a, b)
+    }
 }
 fn map_screen_to_world(singl: &Singleton) -> f64 {
     map_screen_to_world_with_dims(singl, screen_width() as f64, screen_height() as f64)
@@ -224,50 +357,68 @@ fn apply_zoom_lerp(singl: &mut Singleton) {
     }
 }
 
-fn band_height_for(singl: &Singleton, screen_height: usize) -> usize {
-    let mut band_height = screen_height / singl.bands;
-    band_height += band_height * singl.bands / 10;
-    band_height
+fn render_dimensions(screen_width: usize, screen_height: usize, render_scale: f32) -> (usize, usize) {
+    let width = ((screen_width as f32) * render_scale).round().max(1.0) as usize;
+    let height = ((screen_height as f32) * render_scale).round().max(1.0) as usize;
+    (width, height)
 }
 
-fn band_height_for_dims(bands: usize, screen_height: usize) -> usize {
-    let mut band_height = screen_height / bands;
-    band_height += band_height * bands / 10;
-    band_height
+fn tile_layout(width: usize, height: usize, tile_size: usize) -> (usize, usize) {
+    let cols = (width + tile_size - 1) / tile_size;
+    let rows = (height + tile_size - 1) / tile_size;
+    (cols, rows)
 }
 
-fn empty_band_images(singl: &Singleton, screen_width: usize, screen_height: usize) -> Vec<Image> {
-    let mut bands = Vec::new();
-    for i in 0..singl.bands {
-        bands.push(i);
+fn tiles_checkerboard(width: usize, height: usize, tile_size: usize) -> (Vec<Tile>, usize, usize) {
+    let (cols, rows) = tile_layout(width, height, tile_size);
+    let mut even = Vec::new();
+    let mut odd = Vec::new();
+    let center_x = (cols as f32) * 0.5;
+    let center_y = (rows as f32) * 0.5;
+
+    for row in 0..rows {
+        for col in 0..cols {
+            let x = col * tile_size;
+            let y = row * tile_size;
+            let width_tile = (tile_size).min(width.saturating_sub(x));
+            let height_tile = (tile_size).min(height.saturating_sub(y));
+            let index = row * cols + col;
+            let dx = col as f32 + 0.5 - center_x;
+            let dy = row as f32 + 0.5 - center_y;
+            let dist = dx * dx + dy * dy;
+            let tile = Tile {
+                index,
+                x,
+                y,
+                width: width_tile,
+                height: height_tile,
+            };
+            if (row + col) % 2 == 0 {
+                even.push((dist, tile));
+            } else {
+                odd.push((dist, tile));
+            }
+        }
     }
 
-    let mut images = Vec::new();
-    let band_height = band_height_for(singl, screen_height);
-    for _ in 0..singl.bands {
-        images.push(Image::gen_image_color(
-            screen_width as u16,
-            band_height as u16,
-            Color::new(0., 0., 0., 0.),
-        ));
-    }
-    images
+    even.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    odd.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut tiles = Vec::with_capacity(cols * rows);
+    tiles.extend(even.into_iter().map(|entry| entry.1));
+    tiles.extend(odd.into_iter().map(|entry| entry.1));
+    (tiles, cols, rows)
 }
 
-fn empty_iter_bands(singl: &Singleton, screen_width: usize, screen_height: usize) -> Vec<Vec<u16>> {
-    let band_height = band_height_for(singl, screen_height);
-    let mut bands = Vec::new();
-    for _ in 0..singl.bands {
-        bands.push(vec![0u16; screen_width * band_height]);
-    }
-    bands
+fn empty_render_image(width: usize, height: usize) -> Image {
+    Image::gen_image_color(width as u16, height as u16, Color::new(0., 0., 0., 0.))
 }
 
 fn image_from_iters(iters: &[u16], width: usize, height: usize, pallet: &[Color]) -> Image {
-    let mut image = Image::gen_image_color(width as u16, height as u16, WHITE);
+    let mut image = Image::gen_image_color(width as u16, height as u16, Color::new(0., 0., 0., 1.0));
     let max_index = pallet.len().saturating_sub(1);
-    for x in 0..width as u32 {
-        for y in 0..height as u32 {
+    for y in 0..height as u32 {
+        for x in 0..width as u32 {
             let index = (y as usize) * width + x as usize;
             let iter = iters[index] as usize;
             let color = pallet[iter.min(max_index)];
@@ -277,172 +428,134 @@ fn image_from_iters(iters: &[u16], width: usize, height: usize, pallet: &[Color]
     image
 }
 
-fn fractal_iter_bands(singl: &Singleton, screen_width: usize, screen_height: usize) -> Vec<Vec<u16>> {
-    let mut bands = Vec::new();
-    for i in 0..singl.bands {
-        bands.push(i);
-    }
-
-    let bands_mutex = Arc::new(Mutex::new(bands));
-    let iter_mutex = Arc::new(Mutex::new(empty_iter_bands(singl, screen_width, screen_height)));
-    let singl_mutex = Arc::new(singl.clone());
-
-    let mut handles = Vec::new();
-    for _ in 0..singl.threads {
-        let singl_clone = Arc::clone(&singl_mutex);
-        let bands_clone = Arc::clone(&bands_mutex);
-        let iter_clone = Arc::clone(&iter_mutex);
-        let handle = thread::spawn(move || {
-            let local_singl = singl_clone;
-            loop {
-                let mut bands = bands_clone.lock().unwrap();
-                if bands.len() == 0 {
-                    break;
-                }
-                let index = bands.remove(0);
-                drop(bands);
-
-                let band_height = band_height_for(&local_singl, screen_height);
-                let mut iters = vec![0u16; screen_width * band_height];
-
-                for x in 0..screen_width as u32 {
-                    for y in 0..band_height as u32 {
-                        let point = Point::<f64> {
-                            x: x as f64,
-                            y: (index * band_height) as f64 + y as f64,
-                        }
-                        .to_world_with_dims(&local_singl, screen_width as f64, screen_height as f64);
-                        let c = num::complex::Complex::<f64>::new(point.x, point.y);
-
-                        let iter = mandelbrot(c, &local_singl);
-                        let offset = (y as usize) * screen_width + x as usize;
-                        iters[offset] = iter.min(u16::MAX as usize) as u16;
-                    }
-                }
-
-                let mut iter_bands = iter_clone.lock().unwrap();
-                iter_bands[index] = iters;
-                drop(iter_bands);
-                thread::sleep(Duration::from_millis(1));
-            }
-        });
-        handles.push(handle);
-    }
-
-    for h in handles {
-        h.join().unwrap();
-    }
-
-    let iter_clone = Arc::clone(&iter_mutex);
-    let iter_bands = iter_clone.lock().unwrap();
-    let mut result = Vec::new();
-    for i in 0..singl.bands {
-        result.push(iter_bands[i].clone());
-    }
-    drop(iter_bands);
-    result
-}
-
-fn textures_from_images(images: Vec<Image>) -> Vec<Texture2D> {
-    let mut textures = Vec::new();
-    for image in images {
-        let texture = Texture2D::from_image(&image);
-        texture.set_filter(FilterMode::Linear);
-        textures.push(texture);
-    }
-    textures
-}
-
-fn images_from_iter_bands(
-    iter_bands: &[Vec<u16>],
+fn image_from_iters_with_mask(
+    iters: &[u16],
     width: usize,
     height: usize,
     pallet: &[Color],
-) -> Vec<Image> {
-    let band_height = band_height_for_dims(iter_bands.len(), height);
-    let mut images = Vec::new();
-    for band in iter_bands {
-        images.push(image_from_iters(band, width, band_height, pallet));
+    tile_done: &[bool],
+    tile_cols: usize,
+    tile_rows: usize,
+    tile_size: usize,
+) -> Image {
+    let mut image = empty_render_image(width, height);
+    let max_index = pallet.len().saturating_sub(1);
+    for row in 0..tile_rows {
+        for col in 0..tile_cols {
+            let tile_index = row * tile_cols + col;
+            if !tile_done.get(tile_index).copied().unwrap_or(false) {
+                continue;
+            }
+            let x0 = col * tile_size;
+            let y0 = row * tile_size;
+            let tile_w = tile_size.min(width.saturating_sub(x0));
+            let tile_h = tile_size.min(height.saturating_sub(y0));
+            for y in 0..tile_h {
+                let y_abs = y0 + y;
+                let row_offset = y_abs * width + x0;
+                for x in 0..tile_w {
+                    let iter = iters[row_offset + x] as usize;
+                    let color = pallet[iter.min(max_index)];
+                    image.set_pixel((x0 + x) as u32, (y0 + y) as u32, color);
+                }
+            }
+        }
     }
-    images
+    image
 }
 
-fn update_cache_textures_from_iters(cache: &mut RenderCache, pallet: &[Color]) {
-    if cache.iter_bands.is_empty() {
-        return;
-    }
-    let width = cache.screen_width as usize;
-    let height = cache.screen_height as usize;
-    let band_height = band_height_for_dims(cache.iter_bands.len(), height);
-    for (index, band) in cache.iter_bands.iter().enumerate() {
-        if index >= cache.textures.len() {
-            continue;
+fn update_image_tile(
+    image: &mut Image,
+    tile_iters: &[u16],
+    tile_x: usize,
+    tile_y: usize,
+    tile_w: usize,
+    tile_h: usize,
+    pallet: &[Color],
+) {
+    let max_index = pallet.len().saturating_sub(1);
+    for y in 0..tile_h {
+        let row_offset = y * tile_w;
+        for x in 0..tile_w {
+            let iter = tile_iters[row_offset + x] as usize;
+            let color = pallet[iter.min(max_index)];
+            image.set_pixel((tile_x + x) as u32, (tile_y + y) as u32, color);
         }
-        if band.len() != width * band_height {
-            continue;
-        }
-        let image = image_from_iters(band, width, band_height, pallet);
-        let texture = Texture2D::from_image(&image);
-        texture.set_filter(FilterMode::Linear);
-        cache.textures[index] = texture;
     }
 }
 
-fn draw_cached_textures(cache: &RenderCache, singl: &Singleton) {
-    if cache.textures.is_empty() {
-        return;
-    }
+fn texture_from_image(image: &Image) -> Texture2D {
+    let texture = Texture2D::from_image(image);
+    texture.set_filter(FilterMode::Linear);
+    texture
+}
 
+fn recolor_cache(cache: &mut RenderCache, pallet: &[Color]) {
+    let width = cache.render_width as usize;
+    let height = cache.render_height as usize;
+    let image = image_from_iters(&cache.iters, width, height, pallet);
+    cache.texture = texture_from_image(&image);
+}
+
+fn draw_cached_texture(cache: &RenderCache, singl: &Singleton) {
     let screen_w = screen_width();
     let screen_h = screen_height();
     let unit_old = map_screen_to_world_with_dims_scale(
         cache.scale,
-        cache.screen_width as f64,
-        cache.screen_height as f64,
+        cache.viewport_width as f64,
+        cache.viewport_height as f64,
     );
     let unit_new = map_screen_to_world_with_dims_scale(singl.scale, screen_w as f64, screen_h as f64);
-    let scale = (unit_old / unit_new) as f32;
+    let scale_world = (unit_old / unit_new) as f32;
+    let scale_render_x = cache.viewport_width / cache.render_width.max(1.0);
+    let scale_render_y = cache.viewport_height / cache.render_height.max(1.0);
+    let scale_x = scale_world * scale_render_x;
+    let scale_y = scale_world * scale_render_y;
 
     let offset_x = screen_w / 2.0
-        - (cache.screen_width * scale) / 2.0
+        - (cache.render_width * scale_x) / 2.0
         + ((cache.center.x - singl.center.x) / unit_new) as f32
         + singl.offset.1.x;
     let offset_y = screen_h / 2.0
-        - (cache.screen_height * scale) / 2.0
+        - (cache.render_height * scale_y) / 2.0
         + ((singl.center.y - cache.center.y) / unit_new) as f32
         + singl.offset.1.y;
 
-    for i in 0..cache.textures.len() {
-        let texture = &cache.textures[i];
-        let dest_size = vec2(texture.width() * scale, texture.height() * scale);
-        draw_texture_ex(
-            texture,
-            offset_x,
-            offset_y + i as f32 * texture.height() * scale,
-            WHITE,
-            DrawTextureParams {
-                dest_size: Some(dest_size),
-                ..Default::default()
-            },
-        );
-    }
+    let dest_size = vec2(cache.texture.width() * scale_x, cache.texture.height() * scale_y);
+    draw_texture_ex(
+        &cache.texture,
+        offset_x,
+        offset_y,
+        WHITE,
+        DrawTextureParams {
+            dest_size: Some(dest_size),
+            ..Default::default()
+        },
+    );
 }
 
 fn start_fractal_job(
     singl: &Singleton,
-    screen_width: usize,
-    screen_height: usize,
+    render_width: usize,
+    render_height: usize,
+    viewport_width: usize,
+    viewport_height: usize,
     render_id: u64,
+    active_render_id: Arc<AtomicU64>,
+    tiles: Vec<Tile>,
+    total_tiles: usize,
     sender: mpsc::Sender<RenderMessage>,
 ) {
     log_event(
         "render_start",
         &format!(
-            "id={} size={}x{} bands={} threads={} max_iter={} power={} scale={}",
+            "id={} size={}x{} render={}x{} tiles={} threads={} max_iter={} power={} scale={}",
             render_id,
-            screen_width,
-            screen_height,
-            singl.bands,
+            viewport_width,
+            viewport_height,
+            render_width,
+            render_height,
+            total_tiles,
             singl.threads,
             singl.max_iter,
             singl.power,
@@ -451,61 +564,93 @@ fn start_fractal_job(
     );
     let singl_clone = singl.clone();
     thread::spawn(move || {
-        let mut bands = band_order_center_out(singl_clone.bands);
-        let bands_mutex = Arc::new(Mutex::new(bands));
+        let tiles_mutex = Arc::new(Mutex::new(tiles));
         let singl_mutex = Arc::new(singl_clone);
         let completed = Arc::new(AtomicUsize::new(0));
 
         let mut handles = Vec::new();
         for _ in 0..singl_mutex.threads {
             let singl_local = Arc::clone(&singl_mutex);
-            let bands_clone = Arc::clone(&bands_mutex);
+            let tiles_clone = Arc::clone(&tiles_mutex);
             let sender_clone = sender.clone();
             let completed_clone = Arc::clone(&completed);
+            let active_id = Arc::clone(&active_render_id);
 
             let handle = thread::spawn(move || loop {
-                let mut bands = bands_clone.lock().unwrap();
-                if bands.is_empty() {
+                if active_id.load(Ordering::SeqCst) != render_id {
                     break;
                 }
-                let index = bands.remove(0);
-                drop(bands);
+                let mut tiles = tiles_clone.lock().unwrap();
+                if tiles.is_empty() {
+                    break;
+                }
+                let tile = tiles.remove(0);
+                drop(tiles);
 
-                let band_height = band_height_for(&singl_local, screen_height);
-                let mut iters = vec![0u16; screen_width * band_height];
+                if active_id.load(Ordering::SeqCst) != render_id {
+                    break;
+                }
 
-                for x in 0..screen_width as u32 {
-                    for y in 0..band_height as u32 {
-                        let point = Point::<f64> {
-                            x: x as f64,
-                            y: (index * band_height) as f64 + y as f64,
+                let unit = map_screen_to_world_with_dims_scale(
+                    singl_local.scale,
+                    viewport_width as f64,
+                    viewport_height as f64,
+                );
+                let half_w = viewport_width as f64 * 0.5;
+                let half_h = viewport_height as f64 * 0.5;
+                let scale_x = viewport_width as f64 / render_width as f64;
+                let scale_y = viewport_height as f64 / render_height as f64;
+                let mut iters = vec![0u16; tile.width * tile.height];
+                let use_simd = should_use_simd(&singl_local);
+
+                for y in 0..tile.height {
+                    if active_id.load(Ordering::SeqCst) != render_id {
+                        return;
+                    }
+                    let y_abs = tile.y + y;
+                    let screen_y = (y_abs as f64) * scale_y;
+                    let world_y = -((screen_y) - half_h) * unit + singl_local.center.y;
+                    let mut x = 0usize;
+                    while x < tile.width {
+                        let x_abs = tile.x + x;
+                        let screen_x0 = (x_abs as f64) * scale_x;
+                        let world_x0 = (screen_x0 - half_w) * unit + singl_local.center.x;
+                        if use_simd && x + 1 < tile.width {
+                            let screen_x1 = ((x_abs + 1) as f64) * scale_x;
+                            let world_x1 = (screen_x1 - half_w) * unit + singl_local.center.x;
+                            let (iter0, iter1) = mandelbrot_pair(world_x0, world_y, world_x1, world_y, &singl_local);
+                            let offset = y * tile.width + x;
+                            iters[offset] = iter0;
+                            iters[offset + 1] = iter1;
+                            x += 2;
+                        } else {
+                            let iter = mandelbrot_scalar(world_x0, world_y, &singl_local);
+                            let offset = y * tile.width + x;
+                            iters[offset] = iter;
+                            x += 1;
                         }
-                        .to_world_with_dims(
-                            &singl_local,
-                            screen_width as f64,
-                            screen_height as f64,
-                        );
-                        let c = num::complex::Complex::<f64>::new(point.x, point.y);
-
-                        let iter = mandelbrot(c, &singl_local);
-                        let offset = (y as usize) * screen_width + x as usize;
-                        iters[offset] = iter.min(u16::MAX as usize) as u16;
                     }
                 }
 
-                let _ = sender_clone.send(RenderMessage::Band {
+                if active_id.load(Ordering::SeqCst) != render_id {
+                    break;
+                }
+                let _ = sender_clone.send(RenderMessage::Tile {
                     id: render_id,
-                    index,
+                    index: tile.index,
+                    x: tile.x,
+                    y: tile.y,
+                    width: tile.width,
+                    height: tile.height,
                     iters,
                 });
 
                 let finished = completed_clone.fetch_add(1, Ordering::SeqCst) + 1;
-                if finished == singl_local.bands {
-                    log_event(
-                        "render_done",
-                        &format!("id={} bands={}", render_id, singl_local.bands),
-                    );
-                    let _ = sender_clone.send(RenderMessage::Done { id: render_id });
+                if finished == total_tiles {
+                    log_event("render_done", &format!("id={} tiles={}", render_id, total_tiles));
+                    if active_id.load(Ordering::SeqCst) == render_id {
+                        let _ = sender_clone.send(RenderMessage::Done { id: render_id });
+                    }
                 }
 
                 thread::sleep(Duration::from_millis(1));
@@ -519,27 +664,76 @@ fn start_fractal_job(
     });
 }
 
-fn band_order_center_out(bands: usize) -> Vec<usize> {
-    if bands == 0 {
-        return Vec::new();
+fn adjusted_render_state(singl: &Singleton) -> Singleton {
+    let mut render = singl.clone();
+    if singl.mouse_click {
+        let unit = map_screen_to_world(singl);
+        render.center.x -= singl.offset.1.x as f64 * unit;
+        render.center.y += singl.offset.1.y as f64 * unit;
     }
-    let mut ordered = Vec::with_capacity(bands);
-    let center = (bands - 1) as isize / 2;
-    ordered.push(center as usize);
-    for step in 1..bands {
-        let above = center - step as isize;
-        let below = center + step as isize;
-        if above >= 0 {
-            ordered.push(above as usize);
-        }
-        if below < bands as isize {
-            ordered.push(below as usize);
-        }
-        if ordered.len() >= bands {
-            break;
-        }
+    render
+}
+
+fn start_render(
+    singl: &Singleton,
+    screen_w: usize,
+    screen_h: usize,
+    render_scale: f32,
+    render_id: &mut u64,
+    active_render_id: &Arc<AtomicU64>,
+    sender: &mpsc::Sender<RenderMessage>,
+) -> InflightRender {
+    let render_scale = render_scale.clamp(0.1, 1.0);
+    let (render_w, render_h) = render_dimensions(screen_w, screen_h, render_scale);
+    let tile_size = singl.tile_size.max(8);
+    let (tiles, tile_cols, tile_rows) = tiles_checkerboard(render_w, render_h, tile_size);
+    let total_tiles = tiles.len();
+    *render_id = render_id.wrapping_add(1);
+    active_render_id.store(*render_id, Ordering::SeqCst);
+
+    let iters = vec![0u16; render_w * render_h];
+    let image = empty_render_image(render_w, render_h);
+    let texture = texture_from_image(&image);
+    let cache = RenderCache {
+        center: singl.center.clone(),
+        scale: singl.scale,
+        power: singl.power,
+        max_iter: singl.max_iter,
+        julia: singl.julia.clone(),
+        render_width: render_w as f32,
+        render_height: render_h as f32,
+        viewport_width: screen_w as f32,
+        viewport_height: screen_h as f32,
+        render_scale,
+        texture,
+        iters,
+    };
+
+    start_fractal_job(
+        singl,
+        render_w,
+        render_h,
+        screen_w,
+        screen_h,
+        *render_id,
+        Arc::clone(active_render_id),
+        tiles,
+        total_tiles,
+        sender.clone(),
+    );
+
+    InflightRender {
+        cache,
+        image,
+        tile_done: vec![false; tile_cols * tile_rows],
+        tile_cols,
+        tile_rows,
+        tile_size,
+        pending_tiles: 0,
+        last_texture_update: Instant::now(),
+        texture_update_interval_ms: 33,
+        texture_update_stride: 4,
     }
-    ordered
 }
 
 fn select_cache_index(caches: &[RenderCache], singl: &Singleton) -> Option<usize> {
@@ -554,7 +748,6 @@ fn select_cache_index(caches: &[RenderCache], singl: &Singleton) -> Option<usize
 
     for (index, cache) in caches.iter().enumerate() {
         if cache.max_iter != singl.max_iter
-            || cache.bands != singl.bands
             || (cache.power - singl.power).abs() > f64::EPSILON
             || (cache.julia.x - singl.julia.x).abs() > f64::EPSILON
             || (cache.julia.y - singl.julia.y).abs() > f64::EPSILON
@@ -563,13 +756,14 @@ fn select_cache_index(caches: &[RenderCache], singl: &Singleton) -> Option<usize
         }
         let unit_old = map_screen_to_world_with_dims_scale(
             cache.scale,
-            cache.screen_width as f64,
-            cache.screen_height as f64,
+            cache.viewport_width as f64,
+            cache.viewport_height as f64,
         );
         let scale_score = (unit_old / unit_new).ln().abs();
+        let res_penalty = (1.0 / cache.render_scale.max(0.01) as f64).ln().max(0.0) * 0.5;
         let dx = (cache.center.x - singl.center.x).abs() / unit_new;
         let dy = (cache.center.y - singl.center.y).abs() / unit_new;
-        let score = scale_score * 2.0 + (dx + dy) / 1000.0;
+        let score = scale_score * 2.0 + (dx + dy) / 1000.0 + res_penalty;
         if score < best_score {
             best_score = score;
             best_index = Some(index);
@@ -597,6 +791,12 @@ fn draw_menus(singl: &mut Singleton) {
                     .changed();
                 needs_refresh |= ui
                     .add(
+                        egui::Slider::new(&mut singl.tile_size, 16usize..=256usize)
+                            .text("Tile size"),
+                    )
+                    .changed();
+                needs_refresh |= ui
+                    .add(
                         egui::Slider::new(&mut singl.animation_unit, 0.0001..=0.1)
                             .text("Animation unit"),
                     )
@@ -606,12 +806,34 @@ fn draw_menus(singl: &mut Singleton) {
                         egui::Slider::new(&mut singl.refresh_limit, 10..=10000).text("Redraw delay"),
                     )
                     .changed();
+                needs_refresh |= ui
+                    .add(
+                        egui::Slider::new(&mut singl.render_debounce_ms, 0u64..=5000u64)
+                            .text("Render debounce (ms)"),
+                    )
+                    .changed();
+                needs_refresh |= ui
+                    .add(
+                        egui::Slider::new(&mut singl.preview_debounce_ms, 0u64..=500u64)
+                            .text("Preview debounce (ms)"),
+                    )
+                    .changed();
+                needs_refresh |= ui
+                    .add(
+                        egui::Slider::new(&mut singl.preview_scale, 0.1f32..=1.0f32)
+                            .text("Preview scale"),
+                    )
+                    .changed();
+                needs_refresh |= ui
+                    .checkbox(&mut singl.preview_while_interacting, "Preview while moving")
+                    .changed();
 
                 if needs_refresh {
                     singl.target_scale = singl.scale;
                     singl.target_center = singl.center.clone();
                     singl.refresh = true;
                     singl.last_refresh = Instant::now();
+                    singl.last_input = Instant::now();
                 }
 
                 let schemes = colorschemes::colorschemes();
@@ -640,9 +862,11 @@ fn draw_menus(singl: &mut Singleton) {
                     singl.offset = (Point { x: 0., y: 0. }, Point { x: 0., y: 0. });
                     singl.last_refresh =
                         Instant::now() - Duration::from_millis(singl.refresh_limit + 1);
+                    singl.last_input = Instant::now();
                 }
                 if ui.button("Animation on/off").clicked() {
                     singl.animation = !singl.animation;
+                    singl.last_input = Instant::now();
                 }
             });
 
@@ -680,6 +904,7 @@ fn draw_menus(singl: &mut Singleton) {
                     singl.refresh = true;
                     singl.last_refresh =
                         Instant::now() - Duration::from_millis(singl.refresh_limit + 1);
+                    singl.last_input = Instant::now();
                 }
                 if ui.button("Center").clicked() {
                     singl.center = Point::<f64> { x: 0., y: 0. };
@@ -688,6 +913,7 @@ fn draw_menus(singl: &mut Singleton) {
                     singl.refresh = true;
                     singl.last_refresh =
                         Instant::now() - Duration::from_millis(singl.refresh_limit + 1);
+                    singl.last_input = Instant::now();
                 }
             });
         });
@@ -746,6 +972,7 @@ fn user_input(singl: &mut Singleton) {
             singl.refresh = true;
             singl.last_refresh =
                 Instant::now() - Duration::from_millis(singl.refresh_limit + 1);
+            singl.last_input = Instant::now();
             log_event(
                 "julia_set",
                 &format!("world=({}, {})", singl.julia.x, singl.julia.y),
@@ -761,6 +988,7 @@ fn user_input(singl: &mut Singleton) {
                 },
                 Point::<f32> { x: 0., y: 0. },
             );
+            singl.last_input = Instant::now();
             log_event(
                 "drag_start",
                 &format!("screen=({}, {})", mouse.0, mouse.1),
@@ -771,6 +999,7 @@ fn user_input(singl: &mut Singleton) {
             let mouse = mouse_position();
             singl.offset.1.x = mouse.0 - singl.offset.0.x;
             singl.offset.1.y = mouse.1 - singl.offset.0.y;
+            singl.last_input = Instant::now();
         }
 
         if is_mouse_button_released(MouseButton::Left) && singl.mouse_click {
@@ -782,6 +1011,7 @@ fn user_input(singl: &mut Singleton) {
             singl.target_center = singl.center.clone();
             singl.refresh = true;
             singl.last_refresh = Instant::now();
+            singl.last_input = Instant::now();
             log_event(
                 "drag_end",
                 &format!("center=({}, {})", singl.center.x, singl.center.y),
@@ -810,6 +1040,7 @@ fn user_input(singl: &mut Singleton) {
             singl.target_center.y += before.y - after.y;
             singl.zoom_pending = true;
             singl.last_zoom_input = Instant::now();
+            singl.last_input = Instant::now();
             log_event(
                 "zoom",
                 &format!(
@@ -823,16 +1054,19 @@ fn user_input(singl: &mut Singleton) {
     if is_key_pressed(KeyCode::Enter) {
         singl.refresh = true;
         singl.last_refresh = Instant::now() - Duration::from_millis(singl.refresh_limit + 1);
+        singl.last_input = Instant::now();
         log_event("refresh", "key=enter");
     }
 
     if is_key_pressed(KeyCode::Escape) {
         singl.egui = !singl.egui;
+        singl.last_input = Instant::now();
         log_event("toggle_ui", &format!("enabled={}", singl.egui));
     }
 
     if is_key_pressed(KeyCode::Space) {
         singl.animation = !singl.animation;
+        singl.last_input = Instant::now();
         log_event("toggle_animation", &format!("enabled={}", singl.animation));
     }
 
@@ -843,6 +1077,7 @@ fn user_input(singl: &mut Singleton) {
         }
         singl.generate_colors();
         singl.recolor = true;
+        singl.last_input = Instant::now();
         let schemes = colorschemes::colorschemes();
         let name = schemes
             .get(singl.colorscheme)
@@ -862,31 +1097,21 @@ async fn main() {
     singl.generate_colors();
     singl.target_scale = singl.scale;
     singl.target_center = singl.center.clone();
+    singl.refresh = true;
+    singl.last_refresh = Instant::now() - Duration::from_millis(singl.refresh_limit + 1);
 
     let screen_w = screen_width() as usize;
     let screen_h = screen_height() as usize;
-    let iter_bands = fractal_iter_bands(&singl, screen_w, screen_h);
-    let images = images_from_iter_bands(&iter_bands, screen_w, screen_h, &singl.pallet);
-    let textures = textures_from_images(images);
-    let mut caches = vec![RenderCache {
-        center: singl.center.clone(),
-        scale: singl.scale,
-        power: singl.power,
-        max_iter: singl.max_iter,
-        bands: singl.bands,
-        julia: singl.julia.clone(),
-        screen_width: screen_w as f32,
-        screen_height: screen_h as f32,
-        textures,
-        iter_bands,
-    }];
+    let mut caches: Vec<RenderCache> = Vec::new();
 
     let (sender, receiver) = mpsc::channel::<RenderMessage>();
     let mut compute_in_flight = false;
     let mut render_id: u64 = 0;
-    let mut inflight_cache: Option<RenderCache> = None;
+    let active_render_id = Arc::new(AtomicU64::new(0));
+    let mut inflight_render: Option<InflightRender> = None;
     let mut last_screen_w = screen_w;
     let mut last_screen_h = screen_h;
+    let mut last_preview_start = Instant::now() - Duration::from_secs(10);
 
     loop {
         clear_background(LIGHTGRAY);
@@ -900,7 +1125,7 @@ async fn main() {
             last_screen_w = current_w;
             last_screen_h = current_h;
             caches.clear();
-            inflight_cache = None;
+            inflight_render = None;
             compute_in_flight = false;
             singl.refresh = true;
             singl.last_refresh = Instant::now() - Duration::from_millis(singl.refresh_limit + 1);
@@ -912,32 +1137,44 @@ async fn main() {
 
         while let Ok(message) = receiver.try_recv() {
             match message {
-                RenderMessage::Band { id, index, iters } => {
+                RenderMessage::Tile {
+                    id,
+                    index,
+                    x,
+                    y,
+                    width,
+                    height,
+                    iters,
+                } => {
                     if id != render_id {
                         continue;
                     }
                     log_event(
-                        "band_complete",
-                        &format!("id={} band={} len={}", id, index, iters.len()),
+                        "tile_complete",
+                        &format!("id={} tile={} size={}x{}", id, index, width, height),
                     );
-                    if let Some(cache) = inflight_cache.as_mut() {
-                        if index < cache.iter_bands.len() {
-                            cache.iter_bands[index] = iters;
-                        }
-                        if index < cache.textures.len() {
-                            let width = cache.screen_width as usize;
-                            let height = cache.screen_height as usize;
-                            let band_height = band_height_for_dims(cache.iter_bands.len(), height);
-                            if cache.iter_bands[index].len() == width * band_height {
-                                let image = image_from_iters(
-                                    &cache.iter_bands[index],
-                                    width,
-                                    band_height,
-                                    &singl.pallet,
-                                );
-                                let texture = Texture2D::from_image(&image);
-                                texture.set_filter(FilterMode::Linear);
-                                cache.textures[index] = texture;
+                    if let Some(inflight) = inflight_render.as_mut() {
+                        let full_width = inflight.cache.render_width as usize;
+                        let full_height = inflight.cache.render_height as usize;
+                        if x + width <= full_width && y + height <= full_height {
+                            for row in 0..height {
+                                let src_offset = row * width;
+                                let dst_offset = (y + row) * full_width + x;
+                                inflight.cache.iters[dst_offset..dst_offset + width]
+                                    .copy_from_slice(&iters[src_offset..src_offset + width]);
+                            }
+                            if index < inflight.tile_done.len() {
+                                inflight.tile_done[index] = true;
+                            }
+                            update_image_tile(&mut inflight.image, &iters, x, y, width, height, &singl.pallet);
+                            inflight.pending_tiles += 1;
+                            let update_due = inflight.pending_tiles >= inflight.texture_update_stride
+                                || inflight.last_texture_update.elapsed().as_millis()
+                                    >= inflight.texture_update_interval_ms as u128;
+                            if update_due {
+                                inflight.cache.texture = texture_from_image(&inflight.image);
+                                inflight.last_texture_update = Instant::now();
+                                inflight.pending_tiles = 0;
                             }
                         }
                     }
@@ -950,18 +1187,19 @@ async fn main() {
                         "render_complete",
                         &format!("id={} caches_before={}", id, caches.len()),
                     );
-                    if let Some(cache) = inflight_cache.take() {
+                    if let Some(mut inflight) = inflight_render.take() {
+                        inflight.cache.texture = texture_from_image(&inflight.image);
                         caches.retain(|existing| {
-                            (existing.scale - cache.scale).abs() > f64::EPSILON
-                                || (existing.center.x - cache.center.x).abs() > f64::EPSILON
-                                || (existing.center.y - cache.center.y).abs() > f64::EPSILON
-                                || (existing.power - cache.power).abs() > f64::EPSILON
-                                || existing.max_iter != cache.max_iter
-                                || existing.bands != cache.bands
-                                || (existing.julia.x - cache.julia.x).abs() > f64::EPSILON
-                                || (existing.julia.y - cache.julia.y).abs() > f64::EPSILON
+                            (existing.scale - inflight.cache.scale).abs() > f64::EPSILON
+                                || (existing.center.x - inflight.cache.center.x).abs() > f64::EPSILON
+                                || (existing.center.y - inflight.cache.center.y).abs() > f64::EPSILON
+                                || (existing.power - inflight.cache.power).abs() > f64::EPSILON
+                                || existing.max_iter != inflight.cache.max_iter
+                                || (existing.render_scale - inflight.cache.render_scale).abs() > f32::EPSILON
+                                || (existing.julia.x - inflight.cache.julia.x).abs() > f64::EPSILON
+                                || (existing.julia.y - inflight.cache.julia.y).abs() > f64::EPSILON
                         });
-                        caches.insert(0, cache);
+                        caches.insert(0, inflight.cache);
                         if caches.len() > 6 {
                             caches.truncate(6);
                         }
@@ -978,22 +1216,34 @@ async fn main() {
         if singl.recolor {
             for cache in caches.iter_mut() {
                 if cache.max_iter == singl.max_iter
-                    && cache.bands == singl.bands
                     && (cache.power - singl.power).abs() <= f64::EPSILON
                     && (cache.julia.x - singl.julia.x).abs() <= f64::EPSILON
                     && (cache.julia.y - singl.julia.y).abs() <= f64::EPSILON
                 {
-                    update_cache_textures_from_iters(cache, &singl.pallet);
+                    recolor_cache(cache, &singl.pallet);
                 }
             }
-            if let Some(cache) = inflight_cache.as_mut() {
-                if cache.max_iter == singl.max_iter
-                    && cache.bands == singl.bands
-                    && (cache.power - singl.power).abs() <= f64::EPSILON
-                    && (cache.julia.x - singl.julia.x).abs() <= f64::EPSILON
-                    && (cache.julia.y - singl.julia.y).abs() <= f64::EPSILON
+            if let Some(inflight) = inflight_render.as_mut() {
+                if inflight.cache.max_iter == singl.max_iter
+                    && (inflight.cache.power - singl.power).abs() <= f64::EPSILON
+                    && (inflight.cache.julia.x - singl.julia.x).abs() <= f64::EPSILON
+                    && (inflight.cache.julia.y - singl.julia.y).abs() <= f64::EPSILON
                 {
-                    update_cache_textures_from_iters(cache, &singl.pallet);
+                    let width = inflight.cache.render_width as usize;
+                    let height = inflight.cache.render_height as usize;
+                    inflight.image = image_from_iters_with_mask(
+                        &inflight.cache.iters,
+                        width,
+                        height,
+                        &singl.pallet,
+                        &inflight.tile_done,
+                        inflight.tile_cols,
+                        inflight.tile_rows,
+                        inflight.tile_size,
+                    );
+                    inflight.cache.texture = texture_from_image(&inflight.image);
+                    inflight.last_texture_update = Instant::now();
+                    inflight.pending_tiles = 0;
                 }
             }
             singl.recolor = false;
@@ -1011,11 +1261,57 @@ async fn main() {
 
         apply_zoom_lerp(&mut singl);
 
-        if singl.refresh && singl.last_refresh.elapsed().as_millis() > singl.refresh_limit as u128 {
+        let input_idle = singl.last_input.elapsed().as_millis() >= singl.input_idle_ms as u128;
+        let input_active = !input_idle;
+        if input_active && compute_in_flight {
+            active_render_id.store(render_id.wrapping_add(1), Ordering::SeqCst);
+            compute_in_flight = false;
+            inflight_render = None;
+        }
+
+        if input_active && singl.preview_while_interacting {
+            let preview_due = last_preview_start.elapsed().as_millis()
+                >= singl.preview_debounce_ms as u128;
+            if preview_due && !compute_in_flight {
+                singl.generate_colors();
+                let screen_w = screen_width() as usize;
+                let screen_h = screen_height() as usize;
+                let render_singl = adjusted_render_state(&singl);
+                log_event(
+                    "preview_start",
+                    &format!(
+                        "id={} size={}x{} scale={} preview_scale={}",
+                        render_id.wrapping_add(1),
+                        screen_w,
+                        screen_h,
+                        render_singl.scale,
+                        singl.preview_scale
+                    ),
+                );
+                inflight_render = Some(start_render(
+                    &render_singl,
+                    screen_w,
+                    screen_h,
+                    singl.preview_scale,
+                    &mut render_id,
+                    &active_render_id,
+                    &sender,
+                ));
+                compute_in_flight = true;
+                last_preview_start = Instant::now();
+            }
+        }
+
+        if singl.refresh
+            && input_idle
+            && singl.last_refresh.elapsed().as_millis() > singl.refresh_limit as u128
+            && singl.last_input.elapsed().as_millis() >= singl.render_debounce_ms as u128
+        {
             if !compute_in_flight {
                 singl.generate_colors();
                 let screen_w = screen_width() as usize;
                 let screen_h = screen_height() as usize;
+                let render_singl = adjusted_render_state(&singl);
                 log_event(
                     "refresh_start",
                     &format!(
@@ -1023,25 +1319,20 @@ async fn main() {
                         render_id.wrapping_add(1),
                         screen_w,
                         screen_h,
-                        singl.scale,
-                        singl.center.x,
-                        singl.center.y
+                        render_singl.scale,
+                        render_singl.center.x,
+                        render_singl.center.y
                     ),
                 );
-                render_id = render_id.wrapping_add(1);
-                inflight_cache = Some(RenderCache {
-                    center: singl.center.clone(),
-                    scale: singl.scale,
-                    power: singl.power,
-                    max_iter: singl.max_iter,
-                    bands: singl.bands,
-                    julia: singl.julia.clone(),
-                    screen_width: screen_w as f32,
-                    screen_height: screen_h as f32,
-                    textures: textures_from_images(empty_band_images(&singl, screen_w, screen_h)),
-                    iter_bands: empty_iter_bands(&singl, screen_w, screen_h),
-                });
-                start_fractal_job(&singl, screen_w, screen_h, render_id, sender.clone());
+                inflight_render = Some(start_render(
+                    &render_singl,
+                    screen_w,
+                    screen_h,
+                    1.0,
+                    &mut render_id,
+                    &active_render_id,
+                    &sender,
+                ));
                 singl.refresh = false;
                 compute_in_flight = true;
             }
@@ -1052,10 +1343,10 @@ async fn main() {
         }
 
         if let Some(index) = select_cache_index(&caches, &singl) {
-            draw_cached_textures(&caches[index], &singl);
+            draw_cached_texture(&caches[index], &singl);
         }
-        if let Some(cache) = inflight_cache.as_ref() {
-            draw_cached_textures(cache, &singl);
+        if let Some(inflight) = inflight_render.as_ref() {
+            draw_cached_texture(&inflight.cache, &singl);
         }
 
         user_input(&mut singl);
