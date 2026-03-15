@@ -9,7 +9,9 @@ use macroquad::window;
 use macroquad::window::*;
 
 use egui;
+use image as image_rs;
 use num;
+use serde::{Deserialize, Serialize};
 // use rand::Rng;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
@@ -18,7 +20,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{fs, io::Write};
+use std::fs;
 
 mod colorschemes;
 
@@ -93,6 +95,21 @@ struct Singleton {
     animation_unit: f64,
     threads: usize,
     recolor: bool,
+    snapshot_files: Vec<String>,
+    snapshot_selected: usize,
+    snapshot_last_scan: Instant,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct SnapshotConfig {
+    center_x: f64,
+    center_y: f64,
+    scale: f64,
+    power: f64,
+    max_iter: usize,
+    colorscheme: usize,
+    julia_x: f64,
+    julia_y: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -179,6 +196,9 @@ impl Default for Singleton {
             animation_unit: 0.01,
             threads: 8,
             recolor: false,
+            snapshot_files: Vec::new(),
+            snapshot_selected: 0,
+            snapshot_last_scan: Instant::now() - Duration::from_secs(10),
         }
     }
 }
@@ -868,6 +888,50 @@ fn draw_menus(singl: &mut Singleton) {
                     singl.animation = !singl.animation;
                     singl.last_input = Instant::now();
                 }
+                if singl.snapshot_last_scan.elapsed().as_millis() > 1000 {
+                    singl.snapshot_files = list_snapshot_configs("captures");
+                    if singl.snapshot_selected >= singl.snapshot_files.len() {
+                        singl.snapshot_selected = 0;
+                    }
+                    singl.snapshot_last_scan = Instant::now();
+                }
+                if ui.button("Refresh snapshots").clicked() {
+                    singl.snapshot_files = list_snapshot_configs("captures");
+                    if singl.snapshot_selected >= singl.snapshot_files.len() {
+                        singl.snapshot_selected = 0;
+                    }
+                    singl.snapshot_last_scan = Instant::now();
+                }
+                let snapshot_label = singl
+                    .snapshot_files
+                    .get(singl.snapshot_selected)
+                    .map(|path| path.split('/').last().unwrap_or(path))
+                    .unwrap_or("(none)");
+                egui::ComboBox::from_label("Snapshot config")
+                    .selected_text(snapshot_label)
+                    .show_ui(ui, |ui| {
+                        for (index, path) in singl.snapshot_files.iter().enumerate() {
+                            let label = path.split('/').last().unwrap_or(path);
+                            if ui.selectable_label(index == singl.snapshot_selected, label).clicked() {
+                                singl.snapshot_selected = index;
+                            }
+                        }
+                    });
+                if ui.button("Load selected config").clicked() {
+                    if let Some(path) = singl.snapshot_files.get(singl.snapshot_selected) {
+                        if let Some(config) = load_snapshot_config(path) {
+                            apply_snapshot_config(singl, config);
+                        }
+                    }
+                }
+                if ui.button("Save snapshot").clicked() {
+                    save_snapshot(singl);
+                }
+                if ui.button("Load last config").clicked() {
+                    if let Some(config) = load_latest_snapshot_config("captures") {
+                        apply_snapshot_config(singl, config);
+                    }
+                }
             });
 
             egui::Window::new("Debugg info").show(egui_ctx, |ui| {
@@ -931,28 +995,120 @@ fn save_snapshot(singl: &Singleton) {
         return;
     }
 
-    let image_path = format!("{}/fractal_{}.png", folder, timestamp);
-    let meta_path = format!("{}/fractal_{}.txt", folder, timestamp);
+    let image_path = format!("{}/fractal_{}.jpg", folder, timestamp);
+    let meta_path = format!("{}/fractal_{}.json", folder, timestamp);
 
     let image = get_screen_data();
-    let _ = image.export_png(&image_path);
+    let _ = save_jpeg(&image, &image_path);
 
-    if let Ok(mut file) = fs::File::create(&meta_path) {
-        let schemes = colorschemes::colorschemes();
-        let scheme_name = schemes
-            .get(singl.colorscheme)
-            .map(|scheme| scheme.name)
-            .unwrap_or("unknown");
-        let _ = writeln!(file, "center_x: {}", singl.center.x);
-        let _ = writeln!(file, "center_y: {}", singl.center.y);
-        let _ = writeln!(file, "scale: {}", singl.scale);
-        let _ = writeln!(file, "power: {}", singl.power);
-        let _ = writeln!(file, "max_iter: {}", singl.max_iter);
-        let _ = writeln!(file, "colorscheme_index: {}", singl.colorscheme);
-        let _ = writeln!(file, "colorscheme_name: {}", scheme_name);
-        let _ = writeln!(file, "julia_x: {}", singl.julia.x);
-        let _ = writeln!(file, "julia_y: {}", singl.julia.y);
+    let config = SnapshotConfig {
+        center_x: singl.center.x,
+        center_y: singl.center.y,
+        scale: singl.scale,
+        power: singl.power,
+        max_iter: singl.max_iter,
+        colorscheme: singl.colorscheme,
+        julia_x: singl.julia.x,
+        julia_y: singl.julia.y,
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&config) {
+        let _ = fs::write(&meta_path, json);
     }
+}
+
+fn save_jpeg(image: &Image, path: &str) -> Result<(), image_rs::ImageError> {
+    let width = image.width as u32;
+    let height = image.height as u32;
+    let mut rgb = Vec::with_capacity((width * height * 3) as usize);
+    let bytes = &image.bytes;
+    for chunk in bytes.chunks_exact(4) {
+        rgb.push(chunk[0]);
+        rgb.push(chunk[1]);
+        rgb.push(chunk[2]);
+    }
+    let buffer = image_rs::RgbImage::from_raw(width, height, rgb)
+        .ok_or_else(|| image_rs::ImageError::Parameter(image_rs::error::ParameterError::from_kind(
+            image_rs::error::ParameterErrorKind::DimensionMismatch,
+        )))?;
+    buffer.save_with_format(path, image_rs::ImageFormat::Jpeg)
+}
+
+fn list_snapshot_configs(folder: &str) -> Vec<String> {
+    let mut entries: Vec<(u64, String)> = Vec::new();
+    if let Ok(dir) = fs::read_dir(folder) {
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+                continue;
+            }
+            let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+            let timestamp = name
+                .strip_prefix("fractal_")
+                .and_then(|rest| rest.strip_suffix(".json"))
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0);
+            entries.push((timestamp, path.to_string_lossy().to_string()));
+        }
+    }
+    entries.sort_by(|a, b| b.0.cmp(&a.0));
+    entries.into_iter().map(|(_, path)| path).collect()
+}
+
+fn latest_snapshot_path(folder: &str) -> Option<String> {
+    let mut best: Option<(u64, String)> = None;
+    let entries = fs::read_dir(folder).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("json") {
+            continue;
+        }
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        let timestamp = name
+            .strip_prefix("fractal_")
+            .and_then(|rest| rest.strip_suffix(".json"))
+            .and_then(|value| value.parse::<u64>().ok());
+        if let Some(ts) = timestamp {
+            let path_string = path.to_string_lossy().to_string();
+            if best.as_ref().map(|(best_ts, _)| ts > *best_ts).unwrap_or(true) {
+                best = Some((ts, path_string));
+            }
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+fn load_latest_snapshot_config(folder: &str) -> Option<SnapshotConfig> {
+    let path = latest_snapshot_path(folder)?;
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn load_snapshot_config(path: &str) -> Option<SnapshotConfig> {
+    let content = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn apply_snapshot_config(singl: &mut Singleton, config: SnapshotConfig) {
+    let schemes = colorschemes::colorschemes();
+    singl.center = Point {
+        x: config.center_x,
+        y: config.center_y,
+    };
+    singl.target_center = singl.center.clone();
+    singl.scale = config.scale.max(1.0);
+    singl.target_scale = singl.scale;
+    singl.power = config.power;
+    singl.max_iter = config.max_iter;
+    singl.colorscheme = config.colorscheme.min(schemes.len().saturating_sub(1));
+    singl.julia = Point {
+        x: config.julia_x,
+        y: config.julia_y,
+    };
+    singl.generate_colors();
+    singl.recolor = true;
+    singl.refresh = true;
+    singl.last_refresh = Instant::now() - Duration::from_millis(singl.refresh_limit + 1);
+    singl.last_input = Instant::now();
 }
 
 fn user_input(singl: &mut Singleton) {
@@ -1349,12 +1505,17 @@ async fn main() {
             draw_cached_texture(&inflight.cache, &singl);
         }
 
-        user_input(&mut singl);
-        draw_menus(&mut singl);
-
         if is_key_pressed(KeyCode::S) {
             save_snapshot(&singl);
         }
+        if is_key_pressed(KeyCode::L) {
+            if let Some(config) = load_latest_snapshot_config("captures") {
+                apply_snapshot_config(&mut singl, config);
+            }
+        }
+
+        user_input(&mut singl);
+        draw_menus(&mut singl);
 
         window::next_frame().await
     }
